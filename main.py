@@ -1,4 +1,5 @@
 import os
+import time
 from datetime import datetime, timedelta
 from typing import Optional, Dict
 from fastapi import FastAPI, HTTPException, Query
@@ -12,16 +13,9 @@ import requests
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Official YouTube API Key configuration
+# Config
 YOUTUBE_API_KEY = "AIzaSyDZqNa-pCcrDQDfo1PB5-LMoIk3mkC9gLg"
-
-# List of public Piped API instances to query for streams
-PIPED_INSTANCES = [
-    "https://pipedapi.kavin.rocks",
-    "https://pipedapi.r4fo.com",
-    "https://api.piped.privacy.com.de",
-    "https://piped-api.garudalinux.org"
-]
+SAVENOW_API_KEY = "ca2e48e551709c20d4192854c6132309fa495303"
 
 # ==================== CACHE MANAGER ====================
 class CacheManager:
@@ -41,36 +35,81 @@ class CacheManager:
     def set(self, key: str, value):
         self.cache[key] = (value, datetime.now())
 
-# ==================== THIRD-PARTY STREAM HANDLER ====================
-class ThirdPartyStreamHandler:
+# ==================== SAVENOW ASYNC STREAM HANDLER ====================
+class SaveNowAsyncStreamHandler:
     def __init__(self):
         self.stream_cache = {}
     
-    def get_stream_from_piped(self, video_id: str) -> Optional[str]:
-        """Fetch stream links using public Piped API instances as a third-party gateway"""
-        for base_url in PIPED_INSTANCES:
-            try:
-                url = f"{base_url}/streams/{video_id}"
-                response = requests.get(url, timeout=5)
-                if response.status_code == 200:
-                    data = response.json()
-                    audio_streams = data.get("audioStreams", [])
-                    # Find the best adaptive or regular audio stream URL
-                    if audio_streams:
-                        # Sort by bitrate or just grab the first valid working stream URL
-                        stream_url = audio_streams[0].get("url")
-                        if stream_url:
-                            logger.info(f"✅ Successfully fetched stream from Piped instance: {base_url}")
-                            self.stream_cache[video_id] = (stream_url, datetime.now())
-                            return stream_url
-            except Exception as e:
-                logger.warning(f"Piped instance {base_url} failed: {e}")
-                continue
-        return None
+    def get_stream(self, video_id: str, format_type: str = "mp3") -> Optional[str]:
+        """Initiates download job via SaveNow /ajax/download.php and polls /ajax/progress.php"""
+        target_url = f"https://www.youtube.com/watch?v={video_id}"
+        init_endpoint = "https://p.savenow.to/ajax/download.php"
+        progress_endpoint = "https://p.savenow.to/ajax/progress.php"
+        
+        params = {
+            "url": target_url,
+            "format": format_type,
+            "apikey": SAVENOW_API_KEY,
+            "add_info": 1,
+            "allow_extended_duration": 1
+        }
+        
+        try:
+            logger.info(f"Initiating SaveNow download job for {video_id} (format: {format_type})")
+            response = requests.get(init_endpoint, params=params, timeout=15)
+            
+            if response.status_code != 200:
+                logger.warning(f"SaveNow init failed with status {response.status_code}: {response.text}")
+                return None
+                
+            data = response.json()
+            if not data.get("success"):
+                logger.error(f"SaveNow job creation rejected: {data}")
+                return None
+                
+            job_id = data.get("id")
+            if not job_id:
+                logger.error("SaveNow response missing job ID.")
+                return None
+                
+            logger.info(f"Job created successfully. ID: {job_id}. Polling for completion...")
+            
+            # Poll progress up to 30 times (~30-45 seconds timeout)
+            max_retries = 30
+            for attempt in range(max_retries):
+                time.sleep(1.5)
+                prog_resp = requests.get(progress_endpoint, params={"id": job_id}, timeout=10)
+                
+                if prog_resp.status_code != 200:
+                    continue
+                    
+                prog_data = prog_resp.json()
+                
+                # Check for explicit failure markers
+                if prog_data.get("success") == 0 or prog_data.get("text") == "Failed":
+                    logger.error(f"SaveNow job failed during processing: {prog_data}")
+                    return None
+                
+                progress_val = prog_data.get("progress", 0)
+                download_url = prog_data.get("download_url")
+                
+                # 1000 represents 100% completion
+                if progress_val >= 1000 and download_url:
+                    logger.info(f"✅ Successfully resolved stream URL for {video_id}")
+                    self.stream_cache[video_id] = (download_url, datetime.now())
+                    return download_url
+                    
+            logger.warning(f"SaveNow job polling timed out for {video_id}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"SaveNow workflow error for {video_id}: {str(e)}")
+            return None
     
     def get_cached_stream(self, video_id: str) -> Optional[str]:
         if video_id in self.stream_cache:
             url, timestamp = self.stream_cache[video_id]
+            # SaveNow dynamic download links typically expire after a period, cache for 15 mins max
             if datetime.now() - timestamp < timedelta(minutes=15):
                 return url
             else:
@@ -78,7 +117,7 @@ class ThirdPartyStreamHandler:
         return None
 
 # ==================== FASTAPI APP ====================
-app = FastAPI(title="Third-Party Gateway Music API", version="1.3.0")
+app = FastAPI(title="SaveNow Official API Gateway Music Service", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -90,7 +129,7 @@ app.add_middleware(
 
 ytmusic = YTMusic()
 cache = CacheManager(ttl_minutes=30)
-streamer = ThirdPartyStreamHandler()
+streamer = SaveNowAsyncStreamHandler()
 
 # ==================== HELPER ====================
 def extract_track(item: Dict) -> Optional[Dict]:
@@ -117,11 +156,11 @@ def extract_track(item: Dict) -> Optional[Dict]:
 @app.get("/")
 def home():
     return {
-        "status": "✅ Online via Third-Party Gateway API",
+        "status": "✅ Online via Official SaveNow API v2",
         "endpoints": {
             "search": "/api/search?q=song",
             "trending": "/api/trending",
-            "stream": "/api/stream/{video_id}",
+            "stream": "/api/stream/{video_id}?format=mp3",
             "recommendations": "/api/recommendations/{video_id}",
             "lyrics": "/api/lyrics/{video_id}",
             "artist": "/api/artist/{artist_name}",
@@ -168,16 +207,17 @@ def get_trending(limit: int = Query(20, ge=1, le=30)):
         raise HTTPException(status_code=500, detail="Trending failed")
 
 @app.get("/api/stream/{video_id}")
-async def stream_track(video_id: str):
-    """Instantly redirects to a direct stream link retrieved via decentralized third-party gateway nodes"""
+async def stream_track(video_id: str, format: str = Query("mp3", description="mp3, 128, 360, 720, etc.")):
+    """Triggers SaveNow job, polls completion, and redirects client to the direct output stream url"""
     try:
+        # Check cache first
         cached_url = streamer.get_cached_stream(video_id)
         if cached_url:
             return RedirectResponse(url=cached_url, status_code=307)
         
-        url = streamer.get_stream_from_piped(video_id)
+        url = streamer.get_stream(video_id, format_type=format)
         if not url:
-            raise HTTPException(status_code=500, detail="All third-party stream gateways exhausted.")
+            raise HTTPException(status_code=500, detail="Could not resolve or poll stream via SaveNow API gateway.")
         
         return RedirectResponse(url=url, status_code=307)
     
