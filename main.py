@@ -35,13 +35,12 @@ class CacheManager:
     def set(self, key: str, value):
         self.cache[key] = (value, datetime.now())
 
-# ==================== SAVENOW ASYNC STREAM HANDLER ====================
+# ==================== SAVENOW ASYNC WORKFLOW HANDLER ====================
 class SaveNowAsyncStreamHandler:
     def __init__(self):
         self.stream_cache = {}
     
     def get_stream(self, video_id: str, format_type: str = "mp3") -> Optional[str]:
-        """Initiates download job via SaveNow /ajax/download.php and polls /ajax/progress.php"""
         target_url = f"https://www.youtube.com/watch?v={video_id}"
         init_endpoint = "https://p.savenow.to/ajax/download.php"
         progress_endpoint = "https://p.savenow.to/ajax/progress.php"
@@ -55,7 +54,7 @@ class SaveNowAsyncStreamHandler:
         }
         
         try:
-            logger.info(f"Initiating SaveNow download job for {video_id} (format: {format_type})")
+            logger.info(f"Initiating SaveNow job for {video_id} (format: {format_type})")
             response = requests.get(init_endpoint, params=params, timeout=15)
             
             if response.status_code != 200:
@@ -74,9 +73,8 @@ class SaveNowAsyncStreamHandler:
                 
             logger.info(f"Job created successfully. ID: {job_id}. Polling for completion...")
             
-            # Poll progress up to 30 times (~30-45 seconds timeout)
-            max_retries = 30
-            for attempt in range(max_retries):
+            # Poll progress up to 30 times (~45 seconds timeout max)
+            for _ in range(30):
                 time.sleep(1.5)
                 prog_resp = requests.get(progress_endpoint, params={"id": job_id}, timeout=10)
                 
@@ -85,17 +83,16 @@ class SaveNowAsyncStreamHandler:
                     
                 prog_data = prog_resp.json()
                 
-                # Check for explicit failure markers
                 if prog_data.get("success") == 0 or prog_data.get("text") == "Failed":
-                    logger.error(f"SaveNow job failed during processing: {prog_data}")
+                    logger.error(f"SaveNow job processing failed: {prog_data}")
                     return None
                 
                 progress_val = prog_data.get("progress", 0)
                 download_url = prog_data.get("download_url")
                 
-                # 1000 represents 100% completion
+                # 1000 denotes 100% completion per specification
                 if progress_val >= 1000 and download_url:
-                    logger.info(f"✅ Successfully resolved stream URL for {video_id}")
+                    logger.info(f"✅ Successfully polled stream URL for {video_id}")
                     self.stream_cache[video_id] = (download_url, datetime.now())
                     return download_url
                     
@@ -109,7 +106,6 @@ class SaveNowAsyncStreamHandler:
     def get_cached_stream(self, video_id: str) -> Optional[str]:
         if video_id in self.stream_cache:
             url, timestamp = self.stream_cache[video_id]
-            # SaveNow dynamic download links typically expire after a period, cache for 15 mins max
             if datetime.now() - timestamp < timedelta(minutes=15):
                 return url
             else:
@@ -117,7 +113,7 @@ class SaveNowAsyncStreamHandler:
         return None
 
 # ==================== FASTAPI APP ====================
-app = FastAPI(title="SaveNow Official API Gateway Music Service", version="2.0.0")
+app = FastAPI(title="SaveNow Asynchronous API Gateway Music Service", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -156,7 +152,7 @@ def extract_track(item: Dict) -> Optional[Dict]:
 @app.get("/")
 def home():
     return {
-        "status": "✅ Online via Official SaveNow API v2",
+        "status": "✅ Online via Official SaveNow Asynchronous API",
         "endpoints": {
             "search": "/api/search?q=song",
             "trending": "/api/trending",
@@ -207,17 +203,16 @@ def get_trending(limit: int = Query(20, ge=1, le=30)):
         raise HTTPException(status_code=500, detail="Trending failed")
 
 @app.get("/api/stream/{video_id}")
-async def stream_track(video_id: str, format: str = Query("mp3", description="mp3, 128, 360, 720, etc.")):
-    """Triggers SaveNow job, polls completion, and redirects client to the direct output stream url"""
+async def stream_track(video_id: str, format: str = Query("mp3", description="mp3, m4a, 360, 720, 1080, mp44k")):
+    """Triggers download job via SaveNow, polls progress until 1000, then redirects user"""
     try:
-        # Check cache first
         cached_url = streamer.get_cached_stream(video_id)
         if cached_url:
             return RedirectResponse(url=cached_url, status_code=307)
         
         url = streamer.get_stream(video_id, format_type=format)
         if not url:
-            raise HTTPException(status_code=500, detail="Could not resolve or poll stream via SaveNow API gateway.")
+            raise HTTPException(status_code=500, detail="Could not complete SaveNow progress polling sequence.")
         
         return RedirectResponse(url=url, status_code=307)
     
