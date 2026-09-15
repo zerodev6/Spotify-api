@@ -6,8 +6,8 @@ import yt_dlp
 
 app = FastAPI(
     title="Spotify-Alternative Music API",
-    description="High-performance music streaming, search, trending charts, lyrics, and recommendation API.",
-    version="3.1.0"
+    description="Full-featured music streaming, search, trending charts, lyrics, recommendations, and cookie auth.",
+    version="3.2.0"
 )
 
 ytmusic = YTMusic()
@@ -16,7 +16,7 @@ ytmusic = YTMusic()
 def home():
     return {
         "status": "online",
-        "message": "Music API is up and running smoothly!",
+        "message": "Music API is online and cookie-ready!",
         "endpoints": {
             "search": "/api/search?q=artist_or_song",
             "trending": "/api/trending",
@@ -28,7 +28,6 @@ def home():
 
 @app.get("/api/search")
 def search_tracks(q: str = Query(..., description="Search song, artist, or album")):
-    """Search tracks with complete metadata"""
     try:
         search_results = ytmusic.search(q, filter="songs", limit=20)
         tracks = []
@@ -59,7 +58,6 @@ def search_tracks(q: str = Query(..., description="Search song, artist, or album
 
 @app.get("/api/trending")
 def get_trending():
-    """Get global trending music hits"""
     try:
         search_results = ytmusic.search("Global top hits music", filter="songs", limit=20)
         tracks = []
@@ -85,7 +83,6 @@ def get_trending():
 
 @app.get("/api/recommendations/{video_id}")
 def get_recommendations(video_id: str):
-    """Get related tracks/recommendations (Spotify Radio feature equivalent)"""
     try:
         watch_playlist = ytmusic.get_watch_playlist(videoId=video_id)
         tracks = []
@@ -111,7 +108,6 @@ def get_recommendations(video_id: str):
 
 @app.get("/api/lyrics/{video_id}")
 def get_lyrics(video_id: str):
-    """Fetch structured song lyrics"""
     try:
         watch_playlist = ytmusic.get_watch_playlist(videoId=video_id)
         lyrics_browse_id = watch_playlist.get("lyrics")
@@ -124,17 +120,21 @@ def get_lyrics(video_id: str):
 
 @app.get("/api/stream/{video_id}")
 def stream_track(video_id: str):
-    """Extracts stream URL safely using the Android client to bypass cloud restrictions"""
+    """Extracts stream URL with client spoofing and automatic cookies.txt fallback"""
     try:
         ydl_opts = {
             'format': 'bestaudio/best',
             'quiet': True,
             'no_warnings': True,
             'skip_download': True,
-            # Force Android client to prevent bot flag and format availability issues
-            'extractor_args': {'youtube': {'player_client': ['android']}}
+            'extractor_args': {'youtube': {'player_client': ['android', 'web']}}
         }
         
+        # Automatically detect cookies.txt in the app folder if uploaded
+        cookies_path = os.path.join(os.path.dirname(__file__), "cookies.txt")
+        if os.path.exists(cookies_path):
+            ydl_opts['cookiefile'] = cookies_path
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
             audio_url = info.get('url')
