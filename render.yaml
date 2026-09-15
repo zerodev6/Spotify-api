@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: youtube-music-api
+    env: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "8000"
