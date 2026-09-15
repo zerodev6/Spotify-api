@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration
-SAVENOW_API_KEY = os.environ.get("SAVENOW_API_KEY", "ca2e48e551709c20d4192854c6132309fa495303")
+SAVENOW_API_KEY = "ca2e48e551709c20d4192854c6132309fa495303"
 
 app = FastAPI(title="SpotAPI + SaveNow Hybrid Streamer", version="3.1.0")
 
