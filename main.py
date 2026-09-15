@@ -5,31 +5,72 @@ from ytmusicapi import YTMusic
 import yt_dlp
 
 app = FastAPI(
-    title="Spotify-Style YouTube Music API",
-    description="Full music streaming backend with cookie-auth fallback.",
-    version="2.1.1"
+    title="Advanced Spotify-Alternative Music API",
+    description="Full-featured music streaming, search, trending charts, lyrics, and recommendation API with robust bot-bypass configurations.",
+    version="3.0.0"
 )
 
 ytmusic = YTMusic()
 
 @app.get("/")
 def home():
-    return {"status": "online", "message": "API is running with cookie support!"}
+    return {
+        "status": "online",
+        "message": "Welcome to your advanced music application backend!",
+        "endpoints": {
+            "search": "/api/search?q=artist_or_song",
+            "trending": "/api/trending",
+            "recommendations": "/api/recommendations/{video_id}",
+            "lyrics": "/api/lyrics/{video_id}",
+            "stream": "/api/stream/{video_id}"
+        }
+    }
 
 @app.get("/api/search")
-def search_tracks(q: str = Query(..., description="Search term")):
+def search_tracks(q: str = Query(..., description="Search song, artist, or album")):
+    """Search tracks with complete metadata"""
     try:
-        search_results = ytmusic.search(q, filter="songs", limit=15)
+        search_results = ytmusic.search(q, filter="songs", limit=20)
         tracks = []
         for item in search_results:
             thumbnails = item.get("thumbnails", [])
             thumb_url = thumbnails[-1]["url"] if thumbnails else ""
             artists = item.get("artists", [])
             artist_name = artists[0]["name"] if artists else "Unknown Artist"
+            album = item.get("album")
+            album_name = album["name"] if album else "Single"
             video_id = item.get("videoId")
             if not video_id:
                 continue
-                
+            tracks.append({
+                "id": video_id,
+                "title": item.get("title"),
+                "artist": artist_name,
+                "album": album_name,
+                "duration": item.get("duration"),
+                "thumbnail": thumb_url,
+                "stream_url": f"/api/stream/{video_id}",
+                "lyrics_url": f"/api/lyrics/{video_id}",
+                "recommendations_url": f"/api/recommendations/{video_id}"
+            })
+        return {"query": q, "total": len(tracks), "tracks": tracks}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/trending")
+def get_trending():
+    """Get global trending music hits"""
+    try:
+        search_results = ytmusic.search("Global top hits music", filter="songs", limit=20)
+        tracks = []
+        for item in search_results:
+            video_id = item.get("videoId")
+            if not video_id:
+                continue
+            thumbnails = item.get("thumbnails", [])
+            thumb_url = thumbnails[-1]["url"] if thumbnails else ""
+            artists = item.get("artists", [])
+            artist_name = artists[0]["name"] if artists else "Unknown Artist"
             tracks.append({
                 "id": video_id,
                 "title": item.get("title"),
@@ -38,36 +79,39 @@ def search_tracks(q: str = Query(..., description="Search term")):
                 "stream_url": f"/api/stream/{video_id}",
                 "lyrics_url": f"/api/lyrics/{video_id}"
             })
-        return {"query": q, "total": len(tracks), "tracks": tracks}
+        return {"count": len(tracks), "tracks": tracks}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/trending")
-def get_trending():
+@app.get("/api/recommendations/{video_id}")
+def get_recommendations(video_id: str):
+    """Get related tracks/recommendations (Spotify Radio feature equivalent)"""
     try:
-        search_results = ytmusic.search("Top global hits", filter="songs", limit=15)
+        watch_playlist = ytmusic.get_watch_playlist(videoId=video_id)
         tracks = []
-        for item in search_results:
-            video_id = item.get("videoId")
-            if not video_id:
+        for item in watch_playlist.get("tracks", []):
+            vid = item.get("videoId")
+            if not vid:
                 continue
             thumbnails = item.get("thumbnails", [])
             thumb_url = thumbnails[-1]["url"] if thumbnails else ""
             artists = item.get("artists", [])
             artist_name = artists[0]["name"] if artists else "Unknown Artist"
             tracks.append({
-                "id": video_id,
+                "id": vid,
                 "title": item.get("title"),
                 "artist": artist_name,
                 "thumbnail": thumb_url,
-                "stream_url": f"/api/stream/{video_id}"
+                "stream_url": f"/api/stream/{vid}",
+                "lyrics_url": f"/api/lyrics/{vid}"
             })
-        return {"tracks": tracks}
+        return {"seed_video_id": video_id, "recommendations": tracks}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Could not fetch recommendations: {str(e)}")
 
 @app.get("/api/lyrics/{video_id}")
 def get_lyrics(video_id: str):
+    """Fetch structured song lyrics"""
     try:
         watch_playlist = ytmusic.get_watch_playlist(videoId=video_id)
         lyrics_browse_id = watch_playlist.get("lyrics")
@@ -80,16 +124,17 @@ def get_lyrics(video_id: str):
 
 @app.get("/api/stream/{video_id}")
 def stream_track(video_id: str):
-    """Extracts direct audio stream URL using cookies if available"""
+    """Extracts stream URL with multi-client bot bypass and cookie support"""
     try:
         ydl_opts = {
             'format': 'bestaudio/best',
             'quiet': True,
             'no_warnings': True,
             'skip_download': True,
+            # Spoof player clients to bypass cloud-hosting block & reload errors
+            'extractor_args': {'youtube': {'player_client': ['android', 'web']}}
         }
         
-        # Automatically use cookies.txt if it exists in the app folder
         cookies_path = os.path.join(os.path.dirname(__file__), "cookies.txt")
         if os.path.exists(cookies_path):
             ydl_opts['cookiefile'] = cookies_path
@@ -99,7 +144,6 @@ def stream_track(video_id: str):
             audio_url = info.get('url')
             if not audio_url:
                 raise HTTPException(status_code=404, detail="Could not extract audio stream link.")
-            
             return RedirectResponse(url=audio_url, status_code=303)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Streaming error: {str(e)}")
