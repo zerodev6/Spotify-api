@@ -1,45 +1,11 @@
 import os
-import asyncio
-import json
 from datetime import datetime, timedelta
-from typing import List, Optional
-from functools import lru_cache
-from collections import defaultdict
-
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
-from fastapi.responses import RedirectResponse, JSONResponse
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from ytmusicapi import YTMusic
 import yt_dlp
-import aiohttp
-from pydantic import BaseModel
-
-# ==================== DATA MODELS ====================
-class Track(BaseModel):
-    id: str
-    title: str
-    artist: str
-    album: str
-    duration: Optional[int] = None
-    thumbnail: str
-    genre: Optional[str] = None
-    year: Optional[int] = None
-
-class Playlist(BaseModel):
-    id: str
-    name: str
-    description: str
-    tracks: List[Track]
-    created_at: datetime
-    updated_at: datetime
-
-class User(BaseModel):
-    user_id: str
-    username: str
-    created_at: datetime
-    favorites: List[str] = []
-    playlists: List[str] = []
-    history: List[str] = []
 
 # ==================== CACHE MANAGER ====================
 class CacheManager:
@@ -58,64 +24,6 @@ class CacheManager:
     
     def set(self, key: str, value):
         self.cache[key] = (value, datetime.now())
-    
-    def clear(self):
-        self.cache.clear()
-    
-    def invalidate(self, pattern: str):
-        keys_to_delete = [k for k in self.cache.keys() if pattern in k]
-        for k in keys_to_delete:
-            del self.cache[k]
-
-# ==================== DATABASE SIMULATION ====================
-class Database:
-    def __init__(self):
-        self.users = {}
-        self.playlists = {}
-        self.favorites = defaultdict(list)
-        self.history = defaultdict(list)
-        self.queue = defaultdict(list)
-    
-    def create_user(self, user_id: str, username: str) -> User:
-        user = User(user_id=user_id, username=username, created_at=datetime.now())
-        self.users[user_id] = user
-        return user
-    
-    def get_user(self, user_id: str) -> Optional[User]:
-        return self.users.get(user_id)
-    
-    def add_to_favorites(self, user_id: str, track_id: str):
-        if track_id not in self.favorites[user_id]:
-            self.favorites[user_id].append(track_id)
-    
-    def remove_from_favorites(self, user_id: str, track_id: str):
-        if track_id in self.favorites[user_id]:
-            self.favorites[user_id].remove(track_id)
-    
-    def add_to_history(self, user_id: str, track_id: str):
-        self.history[user_id].append((track_id, datetime.now()))
-        # Keep only last 100 tracks
-        if len(self.history[user_id]) > 100:
-            self.history[user_id] = self.history[user_id][-100:]
-    
-    def create_playlist(self, user_id: str, playlist_id: str, name: str, description: str = ""):
-        playlist = Playlist(
-            id=playlist_id,
-            name=name,
-            description=description,
-            tracks=[],
-            created_at=datetime.now(),
-            updated_at=datetime.now()
-        )
-        self.playlists[playlist_id] = playlist
-        if user_id in self.users:
-            self.users[user_id].playlists.append(playlist_id)
-        return playlist
-    
-    def add_to_playlist(self, playlist_id: str, track: Track):
-        if playlist_id in self.playlists:
-            self.playlists[playlist_id].tracks.append(track)
-            self.playlists[playlist_id].updated_at = datetime.now()
 
 # ==================== STREAMING HANDLER ====================
 class StreamingHandler:
@@ -134,7 +42,6 @@ class StreamingHandler:
                 'socket_timeout': 30,
             }
             
-            # Use cookies if available
             cookies_path = os.path.join(os.path.dirname(__file__), "cookies.txt")
             if os.path.exists(cookies_path):
                 ydl_opts['cookiefile'] = cookies_path
@@ -142,7 +49,6 @@ class StreamingHandler:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
                 
-                # Try multiple audio formats
                 url = info.get('url')
                 if not url and 'formats' in info:
                     for fmt in info['formats']:
@@ -161,7 +67,6 @@ class StreamingHandler:
             raise Exception(f"Streaming failed: {str(e)}")
     
     def get_cached_stream(self, video_id: str) -> Optional[str]:
-        """Check if stream is cached and still valid (15 min TTL)"""
         if video_id in self.stream_cache:
             url, timestamp = self.stream_cache[video_id]
             if datetime.now() - timestamp < timedelta(minutes=15):
@@ -172,12 +77,11 @@ class StreamingHandler:
 
 # ==================== FASTAPI APP ====================
 app = FastAPI(
-    title="Spotify-Alternative Music API",
-    description="Full-featured Spotify alternative with search, trending, recommendations, playlists, lyrics, and streaming.",
+    title="Music Streaming API",
+    description="Full-featured music streaming with search, trending, recommendations, lyrics, and streaming.",
     version="4.0.0"
 )
 
-# Add CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -186,46 +90,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize services
 ytmusic = YTMusic()
 cache_manager = CacheManager(ttl_minutes=60)
-db = Database()
 streaming_handler = StreamingHandler()
 
-# ==================== SEARCH ENDPOINTS ====================
+# ==================== HOME ====================
 @app.get("/")
 def home():
     return {
         "status": "online",
         "version": "4.0.0",
-        "message": "Spotify-Alternative API - Full-Featured Music Streaming",
-        "features": [
-            "Advanced Search",
-            "Trending Charts",
-            "Recommendations",
-            "Lyrics",
-            "Streaming",
-            "Playlists",
-            "Favorites",
-            "History",
-            "User Profiles"
-        ],
+        "message": "Music Streaming API",
         "endpoints": {
-            "search": "/api/search?q=artist_or_song&limit=20",
-            "search_advanced": "/api/search/advanced?q=query&type=songs&artist=artist&album=album",
+            "search": "/api/search?q=artist_or_song",
             "trending": "/api/trending",
             "recommendations": "/api/recommendations/{video_id}",
             "lyrics": "/api/lyrics/{video_id}",
             "stream": "/api/stream/{video_id}",
             "artist": "/api/artist/{artist_name}",
             "album": "/api/album/{album_name}",
-            "playlist": "/api/playlist/{playlist_id}",
-            "user": "/api/user/{user_id}",
-            "favorites": "/api/favorites/{user_id}",
-            "history": "/api/history/{user_id}",
         }
     }
 
+# ==================== SEARCH ====================
 @app.get("/api/search")
 def search_tracks(
     q: str = Query(..., description="Search query"),
@@ -261,9 +148,6 @@ def search_tracks(
                     "album": album.get("name", "Single"),
                     "duration": item.get("duration"),
                     "thumbnail": thumb_url,
-                    "play_url": f"/api/stream/{video_id}",
-                    "lyrics_url": f"/api/lyrics/{video_id}",
-                    "recommendations_url": f"/api/recommendations/{video_id}"
                 }
                 tracks.append(track)
             except:
@@ -283,10 +167,11 @@ def search_tracks(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
+# ==================== ADVANCED SEARCH ====================
 @app.get("/api/search/advanced")
 def advanced_search(
     q: str = Query(...),
-    type_filter: str = Query("songs", regex="^(songs|artists|albums|playlists)$"),
+    type_filter: str = Query("songs", pattern="^(songs|artists|albums|playlists)$"),
     artist: Optional[str] = None,
     album: Optional[str] = None,
     limit: int = Query(20, le=50)
@@ -319,10 +204,10 @@ def advanced_search(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ==================== TRENDING & CHARTS ====================
+# ==================== TRENDING ====================
 @app.get("/api/trending")
 def get_trending(limit: int = Query(20, le=50)):
-    """Get trending songs globally with caching"""
+    """Get trending songs globally"""
     cache_key = "trending_global"
     cached = cache_manager.get(cache_key)
     if cached:
@@ -349,8 +234,6 @@ def get_trending(limit: int = Query(20, le=50)):
                     "title": item.get("title"),
                     "artist": artist_name,
                     "thumbnail": thumb_url,
-                    "play_url": f"/api/stream/{video_id}",
-                    "recommendations_url": f"/api/recommendations/{video_id}"
                 })
             except:
                 continue
@@ -391,7 +274,6 @@ def get_recommendations(video_id: str, limit: int = Query(20, le=50)):
                     "title": item.get("title"),
                     "artist": artist_name,
                     "thumbnail": thumb_url,
-                    "play_url": f"/api/stream/{vid}"
                 })
             except:
                 continue
@@ -434,19 +316,17 @@ def get_lyrics(video_id: str):
         return result
     
     except Exception as e:
-        return {"video_id": video_id, "lyrics": f"Could not fetch lyrics: {str(e)}"}
+        return {"video_id": video_id, "lyrics": f"Could not fetch lyrics"}
 
 # ==================== STREAMING ====================
 @app.get("/api/stream/{video_id}")
 async def stream_track(video_id: str):
-    """Get streaming URL with robust error handling and multiple fallbacks"""
+    """Get streaming URL"""
     try:
-        # Check cache first
         cached_url = streaming_handler.get_cached_stream(video_id)
         if cached_url:
             return RedirectResponse(url=cached_url, status_code=307)
         
-        # Get fresh stream
         url = streaming_handler.get_best_stream(video_id)
         
         if not url:
@@ -459,10 +339,10 @@ async def stream_track(video_id: str):
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Streaming error: {str(e)}. Try again in a few moments."
+            detail=f"Streaming error: {str(e)}"
         )
 
-# ==================== ARTIST & ALBUM ====================
+# ==================== ARTIST ====================
 @app.get("/api/artist/{artist_name}")
 def get_artist(artist_name: str, limit: int = Query(10, le=30)):
     """Get artist information and top tracks"""
@@ -478,8 +358,6 @@ def get_artist(artist_name: str, limit: int = Query(10, le=30)):
             raise HTTPException(status_code=404, detail="Artist not found")
         
         artist_info = search_results[0]
-        
-        # Get top tracks
         top_tracks = ytmusic.search(artist_name, filter="songs", limit=limit)
         
         result = {
@@ -491,7 +369,7 @@ def get_artist(artist_name: str, limit: int = Query(10, le=30)):
                 {
                     "id": t.get("videoId"),
                     "title": t.get("title"),
-                    "play_url": f"/api/stream/{t.get('videoId')}"
+                    "artist": artist_name
                 } for t in top_tracks if t.get("videoId")
             ]
         }
@@ -504,9 +382,10 @@ def get_artist(artist_name: str, limit: int = Query(10, le=30)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ==================== ALBUM ====================
 @app.get("/api/album/{album_name}")
 def get_album(album_name: str):
-    """Get album information and tracks"""
+    """Get album information"""
     cache_key = f"album:{album_name}"
     cached = cache_manager.get(cache_key)
     if cached:
@@ -536,143 +415,16 @@ def get_album(album_name: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ==================== PLAYLISTS ====================
-@app.post("/api/playlist")
-def create_playlist(user_id: str, name: str, description: str = ""):
-    """Create a new playlist"""
-    try:
-        playlist_id = f"pl_{user_id}_{int(datetime.now().timestamp())}"
-        playlist = db.create_playlist(user_id, playlist_id, name, description)
-        cache_manager.invalidate("playlist")
-        return {
-            "status": "created",
-            "playlist": {
-                "id": playlist.id,
-                "name": playlist.name,
-                "description": playlist.description,
-                "tracks_count": 0,
-                "created_at": playlist.created_at.isoformat()
-            }
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/playlist/{playlist_id}")
-def get_playlist(playlist_id: str):
-    """Get playlist details"""
-    cache_key = f"playlist:{playlist_id}"
-    cached = cache_manager.get(cache_key)
-    if cached:
-        return cached
-    
-    if playlist_id not in db.playlists:
-        raise HTTPException(status_code=404, detail="Playlist not found")
-    
-    playlist = db.playlists[playlist_id]
-    result = {
-        "id": playlist.id,
-        "name": playlist.name,
-        "description": playlist.description,
-        "tracks_count": len(playlist.tracks),
-        "tracks": playlist.tracks,
-        "created_at": playlist.created_at.isoformat(),
-        "updated_at": playlist.updated_at.isoformat()
-    }
-    
-    cache_manager.set(cache_key, result)
-    return result
-
-# ==================== USER FAVORITES & HISTORY ====================
-@app.post("/api/favorites/{user_id}/{track_id}")
-def add_favorite(user_id: str, track_id: str):
-    """Add track to favorites"""
-    try:
-        db.add_to_favorites(user_id, track_id)
-        cache_manager.invalidate(f"favorites:{user_id}")
-        return {"status": "added", "user_id": user_id, "track_id": track_id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/api/favorites/{user_id}/{track_id}")
-def remove_favorite(user_id: str, track_id: str):
-    """Remove track from favorites"""
-    try:
-        db.remove_from_favorites(user_id, track_id)
-        cache_manager.invalidate(f"favorites:{user_id}")
-        return {"status": "removed", "user_id": user_id, "track_id": track_id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/favorites/{user_id}")
-def get_favorites(user_id: str):
-    """Get user's favorite tracks"""
-    cache_key = f"favorites:{user_id}"
-    cached = cache_manager.get(cache_key)
-    if cached:
-        return cached
-    
-    favorites = db.favorites.get(user_id, [])
-    result = {
-        "user_id": user_id,
-        "count": len(favorites),
-        "favorites": favorites
-    }
-    
-    cache_manager.set(cache_key, result)
-    return result
-
-@app.post("/api/history/{user_id}/{track_id}")
-def add_to_history(user_id: str, track_id: str):
-    """Add track to listening history"""
-    try:
-        db.add_to_history(user_id, track_id)
-        return {"status": "added_to_history", "user_id": user_id, "track_id": track_id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/history/{user_id}")
-def get_history(user_id: str, limit: int = Query(50, le=100)):
-    """Get user's listening history"""
-    history = db.history.get(user_id, [])
-    recent = [(tid, ts.isoformat()) for tid, ts in history[-limit:]]
-    
-    return {
-        "user_id": user_id,
-        "count": len(recent),
-        "history": recent[::-1]  # Most recent first
-    }
-
-# ==================== QUEUE ====================
-@app.post("/api/queue/{user_id}")
-def add_to_queue(user_id: str, track_id: str):
-    """Add track to queue"""
-    db.queue[user_id].append(track_id)
-    return {"status": "added_to_queue", "queue_length": len(db.queue[user_id])}
-
-@app.get("/api/queue/{user_id}")
-def get_queue(user_id: str):
-    """Get user's queue"""
-    queue = db.queue.get(user_id, [])
-    return {"user_id": user_id, "queue_length": len(queue), "queue": queue}
-
-@app.delete("/api/queue/{user_id}")
-def clear_queue(user_id: str):
-    """Clear queue"""
-    db.queue[user_id] = []
-    return {"status": "cleared", "user_id": user_id}
-
-# ==================== HEALTH CHECK ====================
+# ==================== HEALTH ====================
 @app.get("/health")
 def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "cache_size": len(cache_manager.cache),
-        "users": len(db.users),
-        "playlists": len(db.playlists)
+        "cache_size": len(cache_manager.cache)
     }
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
-    uvicorn.run("music_api_enhanced:app", host="0.0.0.0", port=port, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
