@@ -5,9 +5,9 @@ from ytmusicapi import YTMusic
 import yt_dlp
 
 app = FastAPI(
-    title="Advanced Spotify-Alternative Music API",
-    description="Full-featured music streaming, search, trending charts, lyrics, and recommendation API with robust bot-bypass configurations.",
-    version="3.0.0"
+    title="Spotify-Alternative Music API",
+    description="High-performance music streaming, search, trending charts, lyrics, and recommendation API.",
+    version="3.1.0"
 )
 
 ytmusic = YTMusic()
@@ -16,7 +16,7 @@ ytmusic = YTMusic()
 def home():
     return {
         "status": "online",
-        "message": "Welcome to your advanced music application backend!",
+        "message": "Music API is up and running smoothly!",
         "endpoints": {
             "search": "/api/search?q=artist_or_song",
             "trending": "/api/trending",
@@ -124,21 +124,17 @@ def get_lyrics(video_id: str):
 
 @app.get("/api/stream/{video_id}")
 def stream_track(video_id: str):
-    """Extracts stream URL with multi-client bot bypass and cookie support"""
+    """Extracts stream URL safely using the Android client to bypass cloud restrictions"""
     try:
         ydl_opts = {
             'format': 'bestaudio/best',
             'quiet': True,
             'no_warnings': True,
             'skip_download': True,
-            # Spoof player clients to bypass cloud-hosting block & reload errors
-            'extractor_args': {'youtube': {'player_client': ['android', 'web']}}
+            # Force Android client to prevent bot flag and format availability issues
+            'extractor_args': {'youtube': {'player_client': ['android']}}
         }
         
-        cookies_path = os.path.join(os.path.dirname(__file__), "cookies.txt")
-        if os.path.exists(cookies_path):
-            ydl_opts['cookiefile'] = cookies_path
-
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
             audio_url = info.get('url')
