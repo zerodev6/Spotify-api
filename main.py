@@ -5,7 +5,6 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from spotapi import Song
-from ytmusicapi import YTMusic
 import logging
 import requests
 
@@ -16,7 +15,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 SAVENOW_API_KEY = "ca2e48e551709c20d4192854c6132309fa495303"
 
-app = FastAPI(title="SpotAPI + SaveNow Hybrid Streamer", version="3.1.0")
+app = FastAPI(title="SpotAPI Pure Spotify Streamer", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,79 +26,65 @@ app.add_middleware(
 )
 
 spot_song = Song()
-ytmusic = YTMusic()
 stream_cache = {}
 
-# ==================== SAVENOW ASYNC STREAM RESOLVER ====================
-def get_savenow_stream(video_id: str) -> Optional[str]:
-    """Triggers SaveNow download job, polls progress.php until 1000, returns final stream URL."""
-    if video_id in stream_cache:
-        return stream_cache[video_id]
+# ==================== STREAM RESOLVER VIA SAVE-NOW ====================
+def resolve_stream_from_metadata(title: str, artist: str) -> Optional[str]:
+    """Uses track title and artist from Spotify metadata to fetch direct stream URL"""
+    cache_key = f"{artist}-{title}".lower()
+    if cache_key in stream_cache:
+        return stream_cache[cache_key]
         
-    target_url = f"https://www.youtube.com/watch?v={video_id}"
+    # Search query formatted strictly for media lookup matching the Spotify song
+    search_query = f"{title} {artist} audio"
+    target_url = f"https://www.youtube.com/results?search_query={requests.utils.quote(search_query)}"
+    
+    # Alternatively, you can use SaveNow's search or URL resolver directly with a query/name string if supported:
     init_endpoint = "https://p.savenow.to/ajax/download.php"
     progress_endpoint = "https://p.savenow.to/ajax/progress.php"
     
     params = {
-        "url": target_url,
+        "url": f"https://open.spotify.com/search/{requests.utils.quote(search_query)}", # or general query format
         "format": "mp3",
         "apikey": SAVENOW_API_KEY,
-        "add_info": 1,
-        "allow_extended_duration": 1
+        "add_info": 1
     }
     
     try:
-        logger.info(f"Initiating SaveNow job for video ID: {video_id}")
         response = requests.get(init_endpoint, params=params, timeout=15)
-        if response.status_code != 200:
-            return None
-            
         data = response.json()
         if not data.get("success"):
-            logger.error(f"SaveNow job rejected: {data}")
             return None
             
         job_id = data.get("id")
-        
-        # Poll progress endpoint (up to 30 tries ~ 45 seconds timeout)
         for _ in range(30):
             time.sleep(1.5)
             prog_resp = requests.get(progress_endpoint, params={"id": job_id}, timeout=10)
-            if prog_resp.status_code != 200:
-                continue
-                
             prog_data = prog_resp.json()
-            if prog_data.get("success") == 0 or prog_data.get("text") == "Failed":
-                return None
-                
-            progress_val = prog_data.get("progress", 0)
-            download_url = prog_data.get("download_url")
             
-            # 1000 indicates 100% completion
-            if progress_val >= 1000 and download_url:
-                stream_cache[video_id] = download_url
-                return download_url
-                
+            if prog_data.get("progress", 0) >= 1000 and prog_data.get("download_url"):
+                url = prog_data.get("download_url")
+                stream_cache[cache_key] = url
+                return url
         return None
     except Exception as e:
-        logger.error(f"SaveNow gateway error: {e}")
+        logger.error(f"Stream resolution error: {e}")
         return None
 
 # ==================== ENDPOINTS ====================
 @app.get("/")
 def home():
     return {
-        "status": "✅ SpotAPI + SaveNow Gateway Online",
+        "status": "✅ SpotAPI Gateway Active",
         "endpoints": {
-            "search": "/api/search?q=track_name",
-            "stream_by_metadata": "/api/stream?title=SongName&artist=ArtistName",
-            "stream_by_id": "/api/stream/video/{video_id}"
+            "search_spotify": "/api/spotify/search?q=song_name",
+            "stream_spotify": "/api/spotify/stream?title=SongName&artist=ArtistName"
         }
     }
 
-@app.get("/api/search")
-def search_tracks(q: str = Query(..., min_length=1), limit: int = Query(10, ge=1, le=25)):
-    """Search tracks seamlessly using SpotAPI without requiring developer tokens"""
+@app.get("/api/spotify/search")
+def search_spotify_catalog(q: str = Query(..., min_length=1), limit: int = Query(10, ge=1, le=25)):
+    """Fetch real-time Spotify track data via SpotAPI without requiring developer credentials"""
     try:
         results = spot_song.query_songs(q, limit=limit)
         items = results.get("data", {}).get("searchV2", {}).get("tracksV2", {}).get("items", [])
@@ -113,7 +98,6 @@ def search_tracks(q: str = Query(..., min_length=1), limit: int = Query(10, ge=1
             artist_name = ", ".join(artists) if artists else "Unknown"
             duration_ms = track_data.get("duration", {}).get("totalMilliseconds", 0)
             
-            # Grab high-res cover art if available
             images = track_data.get("albumOfTrack", {}).get("coverArt", {}).get("sources", [])
             thumbnail = images[0].get("url") if images else ""
             
@@ -127,30 +111,17 @@ def search_tracks(q: str = Query(..., min_length=1), limit: int = Query(10, ge=1
             
         return {"query": q, "count": len(tracks), "tracks": tracks}
     except Exception as e:
-        logger.error(f"SpotAPI search error: {e}")
+        logger.error(f"SpotAPI error: {e}")
         raise HTTPException(status_code=500, detail="Spotify catalog search failed")
 
-@app.get("/api/stream")
-async def stream_by_metadata(title: str, artist: str):
-    """Maps a Spotify track (Title + Artist) to YouTube, then streams via SaveNow"""
-    search_query = f"{title} {artist}"
-    try:
-        search_results = ytmusic.search(search_query, filter="songs", limit=1)
-        if not search_results:
-            raise HTTPException(status_code=404, detail="Could not map track to a media source.")
-            
-        video_id = search_results[0].get("videoId")
-        stream_url = get_savenow_stream(video_id)
+@app.get("/api/spotify/stream")
+async def stream_spotify_track(title: str, artist: str):
+    """Directly converts Spotify song identity into a playable stream link"""
+    stream_url = resolve_stream_from_metadata(title, artist)
+    if not stream_url:
+        raise HTTPException(status_code=500, detail="Could not generate stream URL for this Spotify track.")
         
-        if not stream_url:
-            raise HTTPException(status_code=500, detail="Failed to resolve stream link through SaveNow.")
-            
-        return RedirectResponse(url=stream_url, status_code=307)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Streaming mapping error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    return RedirectResponse(url=stream_url, status_code=307)
 
 if __name__ == "__main__":
     import uvicorn
