@@ -5,7 +5,6 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from ytmusicapi import YTMusic
-import yt_dlp
 import logging
 import requests
 
@@ -15,6 +14,14 @@ logger = logging.getLogger(__name__)
 
 # Official YouTube API Key configuration
 YOUTUBE_API_KEY = "AIzaSyDZqNa-pCcrDQDfo1PB5-LMoIk3mkC9gLg"
+
+# List of public Piped API instances to query for streams
+PIPED_INSTANCES = [
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.r4fo.com",
+    "https://api.piped.privacy.com.de",
+    "https://piped-api.garudalinux.org"
+]
 
 # ==================== CACHE MANAGER ====================
 class CacheManager:
@@ -34,64 +41,32 @@ class CacheManager:
     def set(self, key: str, value):
         self.cache[key] = (value, datetime.now())
 
-# ==================== STREAMING HANDLER (ROBUST & FIXED) ====================
-class StreamingHandler:
+# ==================== THIRD-PARTY STREAM HANDLER ====================
+class ThirdPartyStreamHandler:
     def __init__(self):
         self.stream_cache = {}
     
-    def get_best_stream(self, video_id: str) -> Optional[str]:
-        """Robust stream extractor using fail-safe format strings"""
-        try:
-            # Use flexible fallback formats to prevent 'Requested format is not available' errors
-            formats = [
-                'bestaudio/best',
-                'best[height<=480]/bestaudio',
-                'best'
-            ]
-            
-            for format_str in formats:
-                try:
-                    ydl_opts = {
-                        'format': format_str,
-                        'quiet': True,
-                        'no_warnings': True,
-                        'skip_download': True,
-                        'socket_timeout': 15,
-                        'extractor_args': {
-                            'youtube': {
-                                'player_client': ['android', 'web'],
-                                'player_skip': ['js', 'configs']
-                            }
-                        },
-                        'http_headers': {
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                        },
-                        'geo_bypass': True,
-                        'geo_bypass_country': 'US',
-                    }
-                    
-                    cookies_path = os.path.join(os.path.dirname(__file__), "cookies.txt")
-                    if os.path.exists(cookies_path):
-                        ydl_opts['cookiefile'] = cookies_path
-                    
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        logger.info(f"Extracting format '{format_str}' for {video_id}")
-                        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-                        
-                        url = info.get('url')
-                        if url:
-                            logger.info(f"✅ Stream successfully resolved for {video_id}")
-                            self.stream_cache[video_id] = (url, datetime.now())
-                            return url
-                except Exception as sub_e:
-                    logger.warning(f"Format {format_str} failed: {sub_e}")
-                    continue
-            
-            raise Exception("All fallback formats exhausted.")
-        
-        except Exception as e:
-            logger.error(f"Stream error for {video_id}: {str(e)}")
-            raise Exception(str(e))
+    def get_stream_from_piped(self, video_id: str) -> Optional[str]:
+        """Fetch stream links using public Piped API instances as a third-party gateway"""
+        for base_url in PIPED_INSTANCES:
+            try:
+                url = f"{base_url}/streams/{video_id}"
+                response = requests.get(url, timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    audio_streams = data.get("audioStreams", [])
+                    # Find the best adaptive or regular audio stream URL
+                    if audio_streams:
+                        # Sort by bitrate or just grab the first valid working stream URL
+                        stream_url = audio_streams[0].get("url")
+                        if stream_url:
+                            logger.info(f"✅ Successfully fetched stream from Piped instance: {base_url}")
+                            self.stream_cache[video_id] = (stream_url, datetime.now())
+                            return stream_url
+            except Exception as e:
+                logger.warning(f"Piped instance {base_url} failed: {e}")
+                continue
+        return None
     
     def get_cached_stream(self, video_id: str) -> Optional[str]:
         if video_id in self.stream_cache:
@@ -103,7 +78,7 @@ class StreamingHandler:
         return None
 
 # ==================== FASTAPI APP ====================
-app = FastAPI(title="Fast Music Streaming API", version="1.2.1")
+app = FastAPI(title="Third-Party Gateway Music API", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -115,16 +90,9 @@ app.add_middleware(
 
 ytmusic = YTMusic()
 cache = CacheManager(ttl_minutes=30)
-streamer = StreamingHandler()
+streamer = ThirdPartyStreamHandler()
 
 # ==================== HELPER ====================
-def verify_video_with_api(video_id: str):
-    try:
-        url = f"https://www.googleapis.com/youtube/v3/videos?part=status&id={video_id}&key={YOUTUBE_API_KEY}"
-        requests.get(url, timeout=3)
-    except Exception as e:
-        logger.warning(f"API check warning: {e}")
-
 def extract_track(item: Dict) -> Optional[Dict]:
     try:
         video_id = item.get("videoId")
@@ -149,8 +117,7 @@ def extract_track(item: Dict) -> Optional[Dict]:
 @app.get("/")
 def home():
     return {
-        "status": "✅ Online & Robust",
-        "api": "Music Streaming Backend",
+        "status": "✅ Online via Third-Party Gateway API",
         "endpoints": {
             "search": "/api/search?q=song",
             "trending": "/api/trending",
@@ -202,16 +169,15 @@ def get_trending(limit: int = Query(20, ge=1, le=30)):
 
 @app.get("/api/stream/{video_id}")
 async def stream_track(video_id: str):
+    """Instantly redirects to a direct stream link retrieved via decentralized third-party gateway nodes"""
     try:
         cached_url = streamer.get_cached_stream(video_id)
         if cached_url:
             return RedirectResponse(url=cached_url, status_code=307)
         
-        verify_video_with_api(video_id)
-
-        url = streamer.get_best_stream(video_id)
+        url = streamer.get_stream_from_piped(video_id)
         if not url:
-            raise Exception("Stream generation failed")
+            raise HTTPException(status_code=500, detail="All third-party stream gateways exhausted.")
         
         return RedirectResponse(url=url, status_code=307)
     
@@ -295,4 +261,4 @@ def health():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
-    uvicur.run("main:app", host="0.0.0.0", port=port)
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
