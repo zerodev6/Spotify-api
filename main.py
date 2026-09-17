@@ -1,8 +1,13 @@
 import os
 import re
+import json
+import asyncio
+import subprocess
+import traceback
+from contextlib import asynccontextmanager
+
 import httpx
 import yt_dlp
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -13,13 +18,26 @@ from fastapi.responses import StreamingResponse
 YOUTUBE_API_KEY = "AIzaSyDZqNa-pCcrDQDfo1PB5-LMoIk3mkC9gLg"
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 LRCLIB_BASE = "https://lrclib.net/api"
+COOKIES_PATH = os.getenv("COOKIES_PATH", "cookies.txt")
+
+# Public Piped instances (fallback resolvers — no video ID exposed to client)
+PIPED_INSTANCES = [
+    "https://pipedapi.kavin.rocks",
+    "https://api.piped.yt",
+    "https://pipedapi.adminforge.de",
+    "https://pipedapi.reallyaweso.me",
+    "https://pipedapi.ducks.party",
+]
 
 # ============================================================
 # APP SETUP
 # ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Warm up yt-dlp in background so first request isn't slow
+    print("[startup] Music API ready")
     yield
+    print("[shutdown] Music API stopped")
 
 app = FastAPI(lifespan=lifespan, title="Direct Audio Music API")
 
@@ -33,12 +51,12 @@ app.add_middleware(
 )
 
 # ============================================================
-# HELPERS
+# HELPERS — YouTube Data API
 # ============================================================
 _ISO_DUR_RE = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
 
+
 def parse_iso_duration(iso: str) -> int:
-    """Convert ISO8601 (PT3M45S) to total seconds."""
     if not iso:
         return 0
     m = _ISO_DUR_RE.match(iso)
@@ -53,7 +71,6 @@ def fmt_duration(seconds: int) -> str:
 
 
 def pick_thumbnail(thumbnails: dict) -> str:
-    """Prefer high → medium → default."""
     for key in ("high", "medium", "standard", "maxres", "default"):
         if key in thumbnails:
             return thumbnails[key]["url"]
@@ -61,7 +78,6 @@ def pick_thumbnail(thumbnails: dict) -> str:
 
 
 async def yt_search_music(query: str, limit: int = 10) -> list[dict]:
-    """Search YouTube Data API limited to Music category."""
     params = {
         "part": "snippet",
         "q": query,
@@ -78,7 +94,6 @@ async def yt_search_music(query: str, limit: int = 10) -> list[dict]:
 
 
 async def yt_video_details(video_ids: list[str]) -> dict:
-    """Fetch snippet + contentDetails for one or many video IDs."""
     if not video_ids:
         return {}
     params = {
@@ -94,18 +109,59 @@ async def yt_video_details(video_ids: list[str]) -> dict:
     return {it["id"]: it for it in items}
 
 
-def extract_audio_stream(video_id: str) -> dict | None:
-    """Use yt-dlp to get a direct audio-only stream URL (no video)."""
+# ============================================================
+# HELPERS — Stream Extraction (3-layer fallback)
+# ============================================================
+
+def _pick_best_audio(formats: list[dict]) -> dict | None:
+    """Choose the highest-bitrate audio-only format."""
+    audio_only = [
+        f for f in formats
+        if f.get("acodec") not in (None, "none")
+        and f.get("vcodec") in (None, "none")
+        and f.get("url")
+    ]
+    if not audio_only:
+        # fallback: any format with audio
+        audio_only = [
+            f for f in formats
+            if f.get("acodec") not in (None, "none") and f.get("url")
+        ]
+    if not audio_only:
+        return None
+    audio_only.sort(key=lambda f: f.get("abr") or 0, reverse=True)
+    return audio_only[0]
+
+
+def _format_stream(best: dict) -> dict:
+    return {
+        "url": best.get("url"),
+        "mimeType": f"audio/{best.get('ext', 'webm')}",
+        "bitrate": best.get("abr"),
+        "ext": best.get("ext"),
+        "filesize": best.get("filesize"),
+    }
+
+
+# -------- Layer 1: yt-dlp Python library --------
+def extract_audio_ytdlp(video_id: str) -> dict | None:
     ydl_opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
+        "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
         "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,
         "skip_download": True,
         "noplaylist": True,
-        "extract_flat": False,
-        # Optional: provide cookies for age/region restricted content
-        # "cookiefile": "cookies.txt",
+        "verbose": True,
+        "extractor_retries": 5,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "tv_embedded", "web_safari"],
+            }
+        },
     }
+    if os.path.exists(COOKIES_PATH):
+        ydl_opts["cookiefile"] = COOKIES_PATH
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(
@@ -114,30 +170,112 @@ def extract_audio_stream(video_id: str) -> dict | None:
             )
             if not info:
                 return None
-            # pick best audio format
-            formats = info.get("formats") or []
-            audio_formats = [
-                f for f in formats if f.get("acodec") not in (None, "none")
-                and f.get("vcodec") in (None, "none")
-            ]
-            if not audio_formats:
+            best = _pick_best_audio(info.get("formats") or [])
+            if not best:
                 return None
-            audio_formats.sort(key=lambda f: f.get("abr") or 0, reverse=True)
-            best = audio_formats[0]
-            return {
-                "url": best.get("url"),
-                "mimeType": f"audio/{best.get('ext', 'webm')}",
-                "bitrate": best.get("abr"),
-                "ext": best.get("ext"),
-                "filesize": best.get("filesize"),
-            }
+            return _format_stream(best)
     except Exception as e:
-        print("yt-dlp error:", e)
+        print(f"[layer1 yt-dlp lib] error for {video_id}: {e}")
+        traceback.print_exc()
         return None
 
 
+# -------- Layer 2: yt-dlp CLI (always-latest logic) --------
+def extract_audio_cli(video_id: str) -> dict | None:
+    cmd = [
+        "yt-dlp",
+        "-f", "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+        "--dump-json",
+        "--no-warnings",
+        "--no-playlist",
+        "--extractor-args", "youtube:player_client=android,ios,tv_embedded",
+        f"https://www.youtube.com/watch?v={video_id}",
+    ]
+    if os.path.exists(COOKIES_PATH):
+        cmd += ["--cookies", COOKIES_PATH]
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=45
+        )
+        if result.returncode != 0:
+            print(f"[layer2 yt-dlp CLI] failed for {video_id}")
+            print(result.stderr[-800:])  # last 800 chars of stderr
+            return None
+        info = json.loads(result.stdout.strip().splitlines()[-1])
+        best = {
+            "url": info.get("url"),
+            "ext": info.get("ext", "webm"),
+            "abr": info.get("abr"),
+            "filesize": info.get("filesize"),
+        }
+        if not best.get("url"):
+            return None
+        return _format_stream(best)
+    except subprocess.TimeoutExpired:
+        print(f"[layer2 yt-dlp CLI] timeout for {video_id}")
+        return None
+    except Exception as e:
+        print(f"[layer2 yt-dlp CLI] error for {video_id}: {e}")
+        return None
+
+
+# -------- Layer 3: Piped public instances --------
+async def extract_audio_piped(video_id: str) -> dict | None:
+    async with httpx.AsyncClient(timeout=15) as client:
+        for base in PIPED_INSTANCES:
+            try:
+                r = await client.get(f"{base}/streams/{video_id}")
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                audios = [s for s in data.get("audioStreams", []) if s.get("url")]
+                if not audios:
+                    continue
+                audios.sort(key=lambda s: s.get("bitrate") or 0, reverse=True)
+                best = audios[0]
+                return {
+                    "url": best["url"],
+                    "mimeType": best.get("mimeType", "audio/webm"),
+                    "bitrate": best.get("bitrate"),
+                    "ext": best.get("format", "webm"),
+                    "filesize": best.get("contentLength"),
+                }
+            except Exception as e:
+                print(f"[layer3 piped {base}] failed: {e}")
+                continue
+    return None
+
+
+# -------- Orchestrator --------
+async def resolve_stream(video_id: str) -> dict | None:
+    """Try lib → CLI → Piped in order."""
+    # Layer 1
+    stream = await asyncio.to_thread(extract_audio_ytdlp, video_id)
+    if stream and stream.get("url"):
+        print(f"[resolve] layer1 OK for {video_id}")
+        return stream
+
+    # Layer 2
+    stream = await asyncio.to_thread(extract_audio_cli, video_id)
+    if stream and stream.get("url"):
+        print(f"[resolve] layer2 OK for {video_id}")
+        return stream
+
+    # Layer 3
+    stream = await extract_audio_piped(video_id)
+    if stream and stream.get("url"):
+        print(f"[resolve] layer3 OK for {video_id}")
+        return stream
+
+    print(f"[resolve] ALL LAYERS FAILED for {video_id}")
+    return None
+
+
+# ============================================================
+# HELPERS — Lyrics (LRCLIB)
+# ============================================================
 async def fetch_lyrics(title: str, artist: str | None = None) -> str | None:
-    """Fetch lyrics from LRCLIB (free, no key required)."""
     params = {"track_name": title}
     if artist:
         params["artist_name"] = artist
@@ -147,18 +285,34 @@ async def fetch_lyrics(title: str, artist: str | None = None) -> str | None:
             if r.status_code == 200:
                 data = r.json()
                 return data.get("plainLyrics") or data.get("syncedLyrics")
-            # fallback to search
-            r2 = await client.get(f"{LRCLIB_BASE}/search", params={"q": f"{artist or ''} {title}".strip()})
+            r2 = await client.get(
+                f"{LRCLIB_BASE}/search",
+                params={"q": f"{artist or ''} {title}".strip()},
+            )
             if r2.status_code == 200 and r2.json():
                 first = r2.json()[0]
                 return first.get("plainLyrics") or first.get("syncedLyrics")
     except Exception as e:
-        print("lyrics error:", e)
+        print(f"[lyrics] error: {e}")
     return None
 
 
 # ============================================================
-# 1. SEARCH  (metadata only — no stream URL)
+# ENDPOINT 1 — Health
+# ============================================================
+@app.get("/")
+async def root():
+    return {
+        "status": "ok",
+        "service": "Direct Audio Music API",
+        "version": "2.0",
+        "ytdlp_version": yt_dlp.version.__version__,
+        "cookies_present": os.path.exists(COOKIES_PATH),
+    }
+
+
+# ============================================================
+# ENDPOINT 2 — Search (metadata only)
 # ============================================================
 @app.get("/api/search")
 async def search_songs(
@@ -175,35 +329,33 @@ async def search_songs(
         if not d:
             continue
         sn = d["snippet"]
+        dur = parse_iso_duration(d["contentDetails"]["duration"])
         results.append({
             "title": sn["title"],
             "artist": sn["channelTitle"],
             "poster": pick_thumbnail(sn.get("thumbnails", {})),
-            "duration": parse_iso_duration(d["contentDetails"]["duration"]),
-            "duration_formatted": fmt_duration(
-                parse_iso_duration(d["contentDetails"]["duration"])
-            ),
+            "duration": dur,
+            "duration_formatted": fmt_duration(dur),
         })
     return {"success": True, "query": q, "count": len(results), "results": results}
 
 
 # ============================================================
-# 2. SONG  (metadata + direct audio stream + optional lyrics)
-#    — NO videoId ever returned
+# ENDPOINT 3 — Song (metadata + stream + lyrics)  ⭐
 # ============================================================
 @app.get("/api/song")
 async def get_song(
     q: str = Query(..., description="Song name / artist / query"),
     include_lyrics: bool = Query(True),
 ):
-    # 1. Search for the top result
+    # 1. Search top result
     items = await yt_search_music(q, limit=1)
     if not items:
         raise HTTPException(404, "Song not found")
 
     internal_video_id = items[0]["id"]["videoId"]
 
-    # 2. Fetch metadata from YouTube Data API
+    # 2. Metadata
     details = await yt_video_details([internal_video_id])
     d = details.get(internal_video_id)
     if not d:
@@ -215,12 +367,17 @@ async def get_song(
     poster = pick_thumbnail(sn.get("thumbnails", {}))
     duration = parse_iso_duration(d["contentDetails"]["duration"])
 
-    # 3. Extract direct audio stream (audio-only, no video URL)
-    stream = extract_audio_stream(internal_video_id)
+    # 3. Resolve stream via multi-layer fallback
+    stream = await resolve_stream(internal_video_id)
     if not stream or not stream.get("url"):
-        raise HTTPException(500, "Could not extract audio stream")
+        raise HTTPException(
+            500,
+            "Could not extract audio stream after trying yt-dlp (lib), "
+            "yt-dlp (CLI), and Piped fallback. "
+            "Check Koyeb logs for details, or add cookies.txt."
+        )
 
-    # 4. Optional lyrics
+    # 4. Lyrics
     lyrics_text = None
     if include_lyrics:
         lyrics_text = await fetch_lyrics(title, artist)
@@ -232,7 +389,7 @@ async def get_song(
         "duration": duration,
         "duration_formatted": fmt_duration(duration),
         "poster": poster,
-        "stream_url": stream["url"],            # direct audio-only URL
+        "stream_url": stream["url"],       # direct audio-only URL — NO video ID
         "stream_mime": stream["mimeType"],
         "stream_bitrate": stream["bitrate"],
         "lyrics": lyrics_text,
@@ -240,7 +397,7 @@ async def get_song(
 
 
 # ============================================================
-# 3. TRENDING MUSIC  (YouTube Data API mostPopular chart)
+# ENDPOINT 4 — Trending
 # ============================================================
 @app.get("/api/trending")
 async def trending(
@@ -277,7 +434,7 @@ async def trending(
 
 
 # ============================================================
-# 4. CORS PROXY  (for the googlevideo.com audio URL)
+# ENDPOINT 5 — CORS Proxy for audio streams
 # ============================================================
 @app.get("/api/proxy")
 async def proxy_audio(url: str = Query(..., description="Encoded audio URL")):
@@ -303,8 +460,8 @@ async def proxy_audio(url: str = Query(..., description="Encoded audio URL")):
 
 
 # ============================================================
-# HEALTH
+# LOCAL DEV
 # ============================================================
-@app.get("/")
-async def root():
-    return {"status": "ok", "service": "Direct Audio Music API"}
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
