@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 
 # ============================== CONFIG ==============================
 
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "AIzaSyDZqNa-pCcrDQDfo1PB5-LMoIk3mkC9gLg")
+YOUTUBE_API_KEY = "AIzaSyDZqNa-pCcrDQDfo1PB5-LMoIk3mkC9gLg"
 YOUTUBE_BASE = "https://www.googleapis.com/youtube/v3"
 MUSIC_CATEGORY_ID = "10"
 
