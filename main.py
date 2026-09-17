@@ -18,7 +18,7 @@ from fastapi.responses import StreamingResponse
 YOUTUBE_API_KEY = "AIzaSyDZqNa-pCcrDQDfo1PB5-LMoIk3mkC9gLg"
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 LRCLIB_BASE = "https://lrclib.net/api"
-COOKIES_PATH = os.getenv("COOKIES_PATH", "cookies.txt")
+COOKIES_PATH = "cookies.txt"
 
 # Public Piped instances (fallback resolvers — no video ID exposed to client)
 PIPED_INSTANCES = [
